@@ -1,5 +1,6 @@
 import xml.etree.ElementTree as ET
 import pandas as pd
+import multiprocessing as mp
 from tqdm import tqdm
 
 def parse_ctm(ctm_file):
@@ -19,8 +20,6 @@ def parse_ctm(ctm_file):
                 'word': word,
                 'confidence': float(confidence)
             })
-
-    print("Done parsing")
     return pd.DataFrame(index)
 
 def parse_queries(query_file):
@@ -32,41 +31,47 @@ def parse_queries(query_file):
         kwid = kw.get('kwid')
         phrase = kw.find('kwtext').text.strip()
         queries.append({'kwid': kwid, 'phrase': phrase, 'words': phrase.split()})
-    print("Done parsing queries")
     return pd.DataFrame(queries)
 
-def perform_kws_search(index_df, queries_df):
-    """Search index for keyword queries, handling multi-word phrases."""
+def search_query(args):
+    """Search for a single query in the index (used for parallel processing)."""
+    query, index_df = args
     hits = []
+    words = query['words']
+    num_words = len(words)
     
-    for _, query in tqdm(queries_df.iterrows(), total=len(queries_df)):
-        words = query['words']
-        num_words = len(words)
+    # Look for possible phrase occurrences in the index
+    for i in range(len(index_df) - num_words + 1):
+        segment = index_df.iloc[i : i + num_words]
         
-        # Look for possible phrase occurrences in the index
-        for i in range(len(index_df) - num_words + 1):
-            segment = index_df.iloc[i : i + num_words]
-            
-            if list(segment['word']) == words:
-                # Ensure time constraints
-                time_diffs = segment['start_time'].diff().fillna(0)
-                if all(time_diffs[1:] <= 0.5):
-                    start_time = segment.iloc[0]['start_time']
-                    end_time = segment.iloc[-1]['start_time'] + segment.iloc[-1]['duration']
-                    duration = end_time - start_time
-                    confidence = segment['confidence'].mean()  # Average confidence over phrase
-                    
-                    hits.append({
-                        'kwid': query['kwid'],
-                        'file_id': segment.iloc[0]['file_id'],
-                        'channel': segment.iloc[0]['channel'],
-                        'start_time': start_time,
-                        'duration': duration,
-                        'score': confidence,  # Use mean confidence
-                        'decision': "YES"
-                    })
+        if list(segment['word']) == words:
+            # Ensure time constraints
+            time_diffs = segment['start_time'].diff().fillna(0)
+            if all(time_diffs[1:] <= 0.5):
+                start_time = segment.iloc[0]['start_time']
+                end_time = segment.iloc[-1]['start_time'] + segment.iloc[-1]['duration']
+                duration = end_time - start_time
+                confidence = segment['confidence'].mean()  # Average confidence over phrase
+                
+                hits.append({
+                    'kwid': query['kwid'],
+                    'file_id': segment.iloc[0]['file_id'],
+                    'channel': segment.iloc[0]['channel'],
+                    'start_time': start_time,
+                    'duration': duration,
+                    'score': confidence,  # Use mean confidence
+                    'decision': "YES"
+                })
+    return hits
+
+def perform_kws_search(index_df, queries_df):
+    """Parallelized search for keyword queries using multiprocessing with progress bar and imap."""
+    with mp.Pool(mp.cpu_count()) as pool:
+        results = list(tqdm(pool.imap(search_query, [(query, index_df) for _, query in queries_df.iterrows()]), 
+                            total=len(queries_df), desc="Processing Queries"))
     
-    print("Done performign kws search")
+    # Flatten the list of lists
+    hits = [hit for sublist in results for hit in sublist]
     return pd.DataFrame(hits)
 
 def save_hits_to_ctm(hits_df, output_file):
